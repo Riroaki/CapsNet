@@ -2,6 +2,7 @@ import torch
 from torch.optim import Adam
 from torch.utils.data import random_split, DataLoader
 from torchvision.datasets import MNIST
+from tqdm import tqdm
 from capsnet import CapsNet, CapsuleLoss
 from torch.utils.data import Dataset
 
@@ -43,6 +44,7 @@ def main():
     EPOCHES = 10
     model.train()
     for ep in range(EPOCHES):
+        train_bar = tqdm(total=500)
         optimizer.zero_grad()
         total_loss = 0.
         for images, labels in train_loader:
@@ -52,20 +54,25 @@ def main():
             total_loss += loss
             loss.backward()
             optimizer.step()
+            train_bar.update()
         print('Total loss for epoch {}: {}'.format(ep + 1, total_loss))
-
-    # Save model
-    torch.save(model.state_dict(), './model/capsnet.pt')
+        train_bar.close()
 
     # Eval
     model.eval()
     correct, total = 0, 0
+    eval_bar = tqdm(total=100)
     for images, labels in test_loader:
         logits, reconstructions = model(images)
         pred_labels = torch.argmax(logits, dim=1)
-        correct += torch.sum(pred_labels == labels)
+        correct += torch.sum(pred_labels == labels).item()
         total += len(labels)
-    print('Acc: {}'.format(correct / total))
+        eval_bar.update()
+    print('Accuracy: {}'.format(correct / total))
+    eval_bar.close()
+
+    # Save model
+    torch.save(model.state_dict(), './model/capsnet.pt')
 
 
 if __name__ == '__main__':
