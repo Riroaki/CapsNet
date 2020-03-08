@@ -1,56 +1,53 @@
+import math
 import torch
-from torch.optim import Adam
-from torch.utils.data import random_split, DataLoader
+from torch import optim
+from torch.utils.data import DataLoader
 from torchvision.datasets import MNIST
 from tqdm import tqdm
 from capsnet import CapsNet, CapsuleLoss
-from torch.utils.data import Dataset
-
-
-class MNISTDataset(Dataset):
-    """Wrap of MNIST dataset from torchvision."""
-
-    def __init__(self, data, labels):
-        self.data = data
-        self.labels = labels
-
-    def __getitem__(self, idx):
-        return self.data[idx], self.labels[idx]
-
-    def __len__(self):
-        return len(self.data)
+from torch.utils.data import TensorDataset
 
 
 def main():
-    torch.autograd.set_detect_anomaly(True)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # Load model
-    model = CapsNet()
-    caps_loss = CapsuleLoss()
-    optimizer = Adam(model.parameters())
+    model = CapsNet().to(device)
+    criterion = CapsuleLoss()
+    optimizer = optim.Adam(model.parameters())
 
     # Load data
+    TRAIN_SIZE, TEST_SIZE = 50000, 10000
     dataset = MNIST(root='./data', download=True)
-    DATA_SPLIT = [50000, 10000]
-    train_data, test_data = random_split(dataset.data.float().unsqueeze(dim=1), DATA_SPLIT)
-    train_label, test_label = random_split(dataset.targets, DATA_SPLIT)
-    train_loader = DataLoader(dataset=MNISTDataset(train_data, train_label),
-                              batch_size=100,
-                              num_workers=4)
-    test_loader = DataLoader(dataset=MNISTDataset(test_data, test_label),
-                             batch_size=100,
-                             num_workers=4)
+    random_indices = torch.randperm(60000)
+    BATCH_SIZE = 100
+    train_loader = DataLoader(
+        dataset=TensorDataset(
+            dataset.data.index_select(dim=0, index=random_indices[:TRAIN_SIZE]),
+            dataset.targets.index_select(dim=0, index=random_indices[:TRAIN_SIZE])),
+        batch_size=BATCH_SIZE,
+        num_workers=4,
+        shuffle=True)
+    test_loader = DataLoader(
+        dataset=TensorDataset(
+            dataset.data.index_select(dim=0, index=random_indices[TRAIN_SIZE:]),
+            dataset.targets.index_select(dim=0, index=random_indices[TRAIN_SIZE:])),
+        batch_size=BATCH_SIZE,
+        num_workers=4,
+        shuffle=True)
 
     # Train
-    EPOCHES = 10
+    EPOCHES = 100
     model.train()
     for ep in range(EPOCHES):
-        train_bar = tqdm(total=500)
+        train_bar = tqdm(total=math.ceil(TRAIN_SIZE / BATCH_SIZE))
         optimizer.zero_grad()
         total_loss = 0.
         for images, labels in train_loader:
+            # Add channels = 1
+            images = (images.float() / 255.0).unsqueeze(dim=1).to(device)
             # Categogrical encoding
-            labels = torch.eye(10).index_select(dim=0, index=labels)
-            loss = caps_loss(images, labels, *model(images))
+            labels = torch.eye(10).index_select(dim=0, index=labels).to(device)
+            loss = criterion(images, labels, *model(images))
             total_loss += loss
             loss.backward()
             optimizer.step()
@@ -61,8 +58,11 @@ def main():
     # Eval
     model.eval()
     correct, total = 0, 0
-    eval_bar = tqdm(total=100)
+    eval_bar = tqdm(total=math.ceil(TEST_SIZE / BATCH_SIZE))
     for images, labels in test_loader:
+        # Add channels = 1
+        images = (images.float() / 255.0).unsqueeze(dim=1).to(device)
+        labels = labels.to(device)
         logits, reconstructions = model(images)
         pred_labels = torch.argmax(logits, dim=1)
         correct += torch.sum(pred_labels == labels).item()
@@ -72,7 +72,7 @@ def main():
     eval_bar.close()
 
     # Save model
-    torch.save(model.state_dict(), './model/capsnet.pt')
+    torch.save(model.state_dict(), './model/capsnet_ep{}_acc{}.pt'.format(EPOCHES, correct / total))
 
 
 if __name__ == '__main__':

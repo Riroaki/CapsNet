@@ -1,6 +1,9 @@
 import torch
 from torch import nn
 
+# Available device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 
 def squash(x, dim=-1):
     squared_norm = (x ** 2).sum(dim=dim, keepdim=True)
@@ -28,7 +31,8 @@ class PrimaryCaps(nn.Module):
         # Shape of out: (batch_size, num_capsules, height, weight, out_channels)
         out = torch.stack(out, dim=0).permute(1, 0, 3, 4, 2)
         # Flatten out: (batch_size, num_capsules * height * weight, out_channels)
-        return squash(out.flatten(start_dim=1, end_dim=-2), dim=-1)
+        batch_size, out_channels = out.shape[0], out.shape[-1]
+        return squash(out.contiguous().view(batch_size, -1, out_channels), dim=-1)
 
 
 class DigitCaps(nn.Module):
@@ -36,30 +40,48 @@ class DigitCaps(nn.Module):
 
     def __init__(self, num_capsules, num_route_nodes, in_channels, out_channels, num_iterations):
         super(DigitCaps, self).__init__()
+        self.num_route_nodes = num_route_nodes
         self.num_capsules = num_capsules
         self.out_channels = out_channels
-        self.route_weights = nn.Parameter(torch.rand(num_route_nodes, in_channels, out_channels),
-                                          requires_grad=True)
+        self.route_weights = nn.Parameter(
+            torch.randn(num_route_nodes, num_capsules, in_channels, out_channels),
+            requires_grad=True)
         self.num_iterations = num_iterations
 
     def forward(self, x):
-        # Shape of u_hat: (batch_size, num_capsules * height * weight, out_channels)
-        u_hat = torch.einsum('ijk, jkl -> ijl', x, self.route_weights)
+        batch_size = x.shape[0]
+        # x: (batch_size, num_route_nodes, in_channels)
+        # route_weights: (num_route_nodes, num_capsules, in_channels, out_channels)
+        # u_hat: (batch_size, num_capsules, num_route_nodes, out_channels)
+        u_hat = torch.einsum('ijk, jlkm -> iljm', x, self.route_weights)
+        # Detatch u_hat during routing iterations
+        u_hat_temp = u_hat.detach()
 
         # Dynamic route
-        b = torch.zeros(x.shape[1], self.num_capsules, requires_grad=True)
-        for it in range(self.num_iterations):
-            c = b.softmax(dim=-1)
+        # b: (batch_size, num_capsules, num_route_nodes)
+        b = torch.zeros(batch_size, self.num_capsules, self.num_route_nodes).to(device)
+        for it in range(self.num_iterations - 1):
+            c = b.softmax(dim=1)
 
-            # Shape of s / v: (batch_size, num_capsules, out_channels)
-            s = torch.einsum('ijk, jl -> ilk', u_hat, c)
-            v = squash(s, dim=-1)
+            # c: (batch_size, num_capsules, num_route_nodes)
+            # u_hat: (batch_size, num_capsules, num_route_nodes, out_channels)
+            # s: (batch_size, num_capsules, out_channels)
+            s = torch.einsum('ijk, ijkl -> ijl', c, u_hat_temp)
+            v = squash(s)
 
             # Update b
-            if it < self.num_iterations - 1:
-                b = b + torch.einsum('ijk, ilk -> jl', u_hat, v)
-            else:
-                return v
+            # u_hat: (batch_size, num_capsules, num_route_nodes, out_channels)
+            # v: (batch_size, num_capsules, out_channels)
+            # Shape of b: (batch_size, num_capsules, num_route_nodes)
+            uv = torch.einsum('ijkl, ijl -> ijk', u_hat_temp, v)
+            b += uv
+
+        # Last iteration with original u_hat to pass gradient
+        c = b.softmax(dim=1)
+        s = torch.einsum('ijk, ijkl -> ijl', c, u_hat_temp)
+        v = squash(s)
+
+        return v
 
 
 class CapsNet(nn.Module):
@@ -104,13 +126,14 @@ class CapsNet(nn.Module):
         logits = torch.norm(out, dim=-1)
 
         # Reconstruction
-        reconstruction = self.decoder(out.flatten(start_dim=1))
+        batch_size = out.shape[0]
+        reconstruction = self.decoder(out.contiguous().view(batch_size, -1))
 
         return logits, reconstruction
 
 
 class CapsuleLoss(nn.Module):
-    """Margin loss & reconstruction loss of capsule network."""
+    """ Combine margin loss & reconstruction loss of capsule network."""
 
     def __init__(self, upper_bound=0.9, lower_bound=0.1, lmda=0.5):
         super(CapsuleLoss, self).__init__()
@@ -124,11 +147,10 @@ class CapsuleLoss(nn.Module):
         batch_size = len(labels)
         left = (self.upper - logits).relu() ** 2  # True negative
         right = (logits - self.lower).relu() ** 2  # False positive
-        margin_loss = torch.sum(labels * left)
-        margin_loss += torch.sum(self.lmda * (1 - labels) * right)
+        margin_loss = torch.sum(labels * left) + self.lmda * torch.sum((1 - labels) * right)
 
         # MSE loss for reconstruction
-        reconstruction_loss = self.mse(reconstructions, images.flatten(start_dim=1))
+        reconstruction_loss = self.mse(reconstructions, images.view(batch_size, -1))
 
         # Combine two losses
         return (margin_loss + 0.0005 * reconstruction_loss) / batch_size
