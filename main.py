@@ -2,62 +2,67 @@ import torch
 from torch import optim
 from torch.utils.data import DataLoader
 from torchvision.datasets import MNIST
+from torchvision.transforms import transforms
 from capsnet import CapsNet, CapsuleLoss
-from torch.utils.data import TensorDataset
+
+# Check cuda availability
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 def main():
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # Load model
     model = CapsNet().to(device)
     criterion = CapsuleLoss()
-    optimizer = optim.Adam(model.parameters())
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.96)
 
     # Load data
-    TRAIN_SIZE, TEST_SIZE = 50000, 10000
-    dataset = MNIST(root='./data', download=True)
-    random_indices = torch.randperm(60000)
-    BATCH_SIZE = 100
+    transform = transforms.Compose([
+        # shift by 2 pixels in either direction with zero padding.
+        transforms.RandomCrop(28, padding=2),
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+    DATA_PATH = './data'
+    BATCH_SIZE = 128
     train_loader = DataLoader(
-        dataset=TensorDataset(
-            dataset.data.index_select(dim=0, index=random_indices[:TRAIN_SIZE]),
-            dataset.targets.index_select(dim=0, index=random_indices[:TRAIN_SIZE])),
+        dataset=MNIST(root=DATA_PATH, download=True, train=True, transform=transform),
         batch_size=BATCH_SIZE,
         num_workers=4,
         shuffle=True)
     test_loader = DataLoader(
-        dataset=TensorDataset(
-            dataset.data.index_select(dim=0, index=random_indices[TRAIN_SIZE:]),
-            dataset.targets.index_select(dim=0, index=random_indices[TRAIN_SIZE:])),
+        dataset=MNIST(root=DATA_PATH, download=True, train=False, transform=transform),
         batch_size=BATCH_SIZE,
         num_workers=4,
         shuffle=True)
 
     # Train
-    EPOCHES = 100
+    EPOCHES = 50
     model.train()
     for ep in range(EPOCHES):
-        optimizer.zero_grad()
-        total_loss = 0.
         batch_id = 1
+        correct, total, total_loss = 0, 0, 0.
         for images, labels in train_loader:
-            # Add channels = 1
-            images = (images.float() / 255.0).unsqueeze(dim=1).to(device)
-            # Categogrical encoding
+            optimizer.zero_grad()
+            images = images.to(device)
             labels = torch.eye(10).index_select(dim=0, index=labels).to(device)
-            logits, reconstruction = model(images, labels)
+            logits, reconstruction = model(images)
+
             # Compute loss & accuracy
             loss = criterion(images, labels, logits, reconstruction)
-            accuracy = torch.sum(
-                torch.argmax(logits, dim=1) == torch.argmax(labels, dim=1)).item() / len(images)
+            correct += torch.sum(
+                torch.argmax(logits, dim=1) == torch.argmax(labels, dim=1)).item()
+            total += len(labels)
+            accuracy = correct / total
             total_loss += loss
             loss.backward()
             optimizer.step()
-            print('Epoch {}, batch {}: {}, accuracy: {}'.format(ep + 1,
-                                                                batch_id,
-                                                                loss.item(),
-                                                                accuracy))
+            print('Epoch {}, batch {}, loss: {}, accuracy: {}'.format(ep + 1,
+                                                                      batch_id,
+                                                                      total_loss / batch_id,
+                                                                      accuracy))
             batch_id += 1
+        scheduler.step(ep)
         print('Total loss for epoch {}: {}'.format(ep + 1, total_loss))
 
     # Eval
@@ -65,10 +70,10 @@ def main():
     correct, total = 0, 0
     for images, labels in test_loader:
         # Add channels = 1
-        images = (images.float() / 255.0).unsqueeze(dim=1).to(device)
+        images = images.to(device)
         # Categogrical encoding
         labels = torch.eye(10).index_select(dim=0, index=labels).to(device)
-        logits, reconstructions = model(images, labels)
+        logits, reconstructions = model(images)
         pred_labels = torch.argmax(logits, dim=1)
         correct += torch.sum(pred_labels == torch.argmax(labels, dim=1)).item()
         total += len(labels)
