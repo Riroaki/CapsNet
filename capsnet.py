@@ -8,7 +8,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 def squash(x, dim=-1):
     squared_norm = (x ** 2).sum(dim=dim, keepdim=True)
     scale = squared_norm / (1 + squared_norm)
-    return scale * x / squared_norm.sqrt()
+    return scale * x / (squared_norm.sqrt() + 1e-8)
 
 
 class PrimaryCaps(nn.Module):
@@ -18,21 +18,19 @@ class PrimaryCaps(nn.Module):
         super(PrimaryCaps, self).__init__()
 
         # Each conv unit stands for a single capsule.
-        self.capsules = nn.ModuleList([nn.Conv2d(in_channels=in_channels,
-                                                 out_channels=out_channels,
-                                                 kernel_size=kernel_size,
-                                                 stride=stride)
-                                       for _ in range(num_conv_units)])
+        self.conv = nn.Conv2d(in_channels=in_channels,
+                              out_channels=out_channels * num_conv_units,
+                              kernel_size=kernel_size,
+                              stride=stride)
+        self.out_channels = out_channels
 
     def forward(self, x):
         # Shape of x: (batch_size, in_channels, height, weight)
         # Shape of out: num_capsules * (batch_size, out_channels, height, weight)
-        out = [capsule(x) for capsule in self.capsules]
-        # Shape of out: (batch_size, num_capsules, height, weight, out_channels)
-        out = torch.stack(out, dim=0).permute(1, 0, 3, 4, 2)
+        out = self.conv(x)
         # Flatten out: (batch_size, num_capsules * height * weight, out_channels)
-        batch_size, out_channels = out.shape[0], out.shape[-1]
-        return squash(out.contiguous().view(batch_size, -1, out_channels), dim=-1)
+        batch_size = out.shape[0]
+        return squash(out.contiguous().view(batch_size, -1, self.out_channels), dim=-1)
 
 
 class DigitCaps(nn.Module):
@@ -117,7 +115,7 @@ class CapsNet(nn.Module):
             nn.Linear(1024, 784),
             nn.Sigmoid())
 
-    def forward(self, x):
+    def forward(self, x, labels):
         out = self.relu(self.conv(x))
         out = self.primary_caps(out)
         out = self.digit_caps(out)
@@ -127,13 +125,13 @@ class CapsNet(nn.Module):
 
         # Reconstruction
         batch_size = out.shape[0]
-        reconstruction = self.decoder(out.contiguous().view(batch_size, -1))
+        reconstruction = self.decoder((out * labels.unsqueeze(2)).contiguous().view(batch_size, -1))
 
         return logits, reconstruction
 
 
 class CapsuleLoss(nn.Module):
-    """ Combine margin loss & reconstruction loss of capsule network."""
+    """Combine margin loss & reconstruction loss of capsule network."""
 
     def __init__(self, upper_bound=0.9, lower_bound=0.1, lmda=0.5):
         super(CapsuleLoss, self).__init__()
